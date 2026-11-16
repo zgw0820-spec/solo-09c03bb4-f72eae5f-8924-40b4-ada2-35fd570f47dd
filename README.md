@@ -32,6 +32,15 @@ curl -s -X POST 'http://localhost:8000/diagnosis?wait=true' | jq '
 
 # 4) 清空故障
 curl -s -X POST http://localhost:8000/faults/reset | jq .
+
+# 演练：cache + gateway 两个独立根因，只清除 cache，gateway 保持故障
+curl -s -X PUT http://localhost:8000/faults/cache   -H 'Content-Type: application/json' -d '{"ready_ok": false}' >/dev/null
+curl -s -X PUT http://localhost:8000/faults/gateway -H 'Content-Type: application/json' -d '{"live_ok": false}' >/dev/null
+BATCH=$(curl -s -X POST 'http://localhost:8000/diagnosis?wait=true')
+curl -s -X POST http://localhost:8000/faults/clear-root-cause \
+  -H 'Content-Type: application/json' \
+  -d "$(echo "$BATCH" | jq -c '{batch_id, state_version, target_service:"cache"}')" | jq \
+  '{status, target_service, remaining_root_causes: [.remaining_root_causes[].service], reasons}'
 ```
 
 本地不装 Docker 时，可直接跑同一套代码（依赖见 `requirements.txt`）：
@@ -56,6 +65,7 @@ DIAG_DB_PATH=/tmp/diagnosis.db python -m uvicorn app.main:app --port 8000 &
 | `GET` | `/diagnosis?limit=` | 最近批次列表 |
 | `PUT` | `/faults/{service}` | 设置 `live_ok` / `ready_ok` / `probe_delay_ms`，**递增全局状态版号** |
 | `POST` | `/faults/reset` | 清空所有本地故障，**递增全局状态版号** |
+| `POST` | `/faults/clear-root-cause` | 按诊断批次**只清除一个服务**的本地根因，随后触发新诊断核对（乐观并发，见下） |
 | `GET` | `/state` | 全局状态版号、批次序号、各服务采用的版号与配置轮次 |
 | `GET` | `/topology` | 依赖拓扑 |
 | `GET` | `/health` | 诊断 API 自身存活 |
@@ -135,6 +145,48 @@ DIAG_DB_PATH=/tmp/diagnosis.db python -m uvicorn app.main:app --port 8000 &
 通过 `config_epoch` 变化发现改动，同样递增并同步全局版号（探测进行中会跳过，
 下一轮补上）。
 
+### 按诊断批次清除单个根因（`POST /faults/clear-root-cause`）
+
+值班演练中同时注入两个独立本地故障（例如 cache 就绪故障 + gateway 存活故障）、
+诊断确认两个根因后，可用该 API **只清除其中一个**，另一个保持故障。请求体：
+
+```json
+{ "batch_id": "<所见诊断批次>", "state_version": <批次全局版号>, "target_service": "cache" }
+```
+
+可带 `?wait_seconds=` 控制等待验证诊断的预算（默认 `DIAG_PROBE_TIMEOUT + 8s`）。
+
+**处理范围（只处理最新已完成诊断中、可达的本地存活或就绪故障）：**
+
+- 批次必须存在且 `completed`，并且是当前**最新的已完成批次**；
+- 批次必须是 `root_cause_found`，且目标服务确实在其 `root_causes` 中；
+- 只接受 `failure = liveness | readiness` 且证据为可达 HTTP 响应的根因；
+  `unreachable` 根因没有管理端口可清，直接拒绝；受牵连（collateral）服务也拒绝；
+- 清除动作只调用目标服务的 `POST /_fault/reset`，**绝不触碰其他服务的故障**。
+
+**旧请求一律拒绝，且拒绝发生在任何写入之前（404/409，无副作用）：**
+
+- 批次不存在 → `404 batch_not_found`；批次未完成 → `409 batch_not_completed`；
+- 已有更新的已完成诊断，或提交版号与批次版号不符 → `409 stale_batch`；
+- 请求提交后全局版号已变化 → `409 state_version_conflict`；
+- 目标服务的 `config_epoch` 与批次证据不一致（说明期间有人直改/重设过该服务）
+  → `409 target_config_changed`；
+- 目标服务当前不可达 → `409 target_unreachable`；目标不是可清根因 →
+  `409 target_not_root_cause` / `not_root_cause_verdict` 等。
+
+**清除后的核对回执：** 守卫通过后，在全局锁内完成「版号 +1 → 全量同步 →
+仅重置目标服务」，释放锁再触发一个全新诊断批次。回执 `status` 只有两种：
+
+- `cleared`：验证诊断证据与当前配置一致（版号、目标 `config_epoch` 未再变化），
+  且目标**不再是根因**；其余根因在 `remaining_root_causes` 中照常报告；
+- `pending_verification`：清除回执不明（管理端重置未确认）、验证探测超时/
+  `needs_retest`、或验证期间版号/目标配置再次变化。此时只报待核实并给出
+  `reasons` 与 `verification_batch_id`，可轮询 `GET /diagnosis/{id}` 自行复核。
+
+**重复旧请求不得改动后来设置的故障：** 由于批次与版号守卫，同一份旧请求重放
+必然命中 `stale_batch` / `state_version_conflict` / `target_config_changed`，
+不会再执行任何重置；后来直改或通过 API 设置的故障原样保留。
+
 ## 目录结构
 
 ```
@@ -150,7 +202,9 @@ app/
   main.py         FastAPI 应用
 tests/
   test_reduction.py  归约逻辑单元测试（14）
+  test_clear_guard.py 单根因清除守卫纯函数单元测试（15）
   test_api.py        真实 uvicorn 进程端到端测试（19）
+  test_clear_api.py  单根因清除 API 端到端测试（11）
 ```
 
 ## 测试
@@ -163,7 +217,9 @@ python -m pytest -q
 测试用随机端口启动 4 个模拟服务与诊断 API 的真实进程，覆盖：健康、四类故障、
 缓存故障去重、双独立故障、超时、版号混杂、依赖检查超时、并发探测、异步批次与
 迟到响应、等待预算到期返回 202 后轮询、重启恢复、版号冲突、Swagger/OpenAPI、
-未知服务。
+未知服务，以及单根因清除的双根因演练、验证诊断审计、旧请求重放不改新故障、
+版号/配置漂移拒绝、受牵连与不可达目标拒绝、待核实回执（等待预算到期、
+验证探测超时）与 OpenAPI 暴露。
 
 ## 已知限制
 

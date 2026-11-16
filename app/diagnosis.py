@@ -316,6 +316,152 @@ def evaluate(
     }
 
 
+def assess_clear_request(
+    *,
+    record: dict[str, Any] | None,
+    latest_completed_batch_id: str | None,
+    expected_version: int,
+    current_state_version: int,
+    target: str,
+    service_states: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """Pure guard for clearing one diagnosed local root cause.
+
+    All the data this function needs is fetched by the caller while holding the
+    coordinator's state lock; keeping the decision itself pure makes every
+    staleness rule unit-testable without processes or network.
+
+    Returns ``{"allowed": bool, "error": str | None, "message": str | None,
+    "batch_config_epoch": int | None, "current_config_epoch": int | None}``.
+    """
+
+    def reject(error: str, message: str) -> dict[str, Any]:
+        return {
+            "allowed": False,
+            "error": error,
+            "message": message,
+            "batch_config_epoch": None,
+            "current_config_epoch": None,
+        }
+
+    if record is None:
+        return reject(
+            "batch_not_found",
+            "the submitted diagnosis batch does not exist; run POST /diagnosis first",
+        )
+    if record.get("status") != "completed":
+        return reject(
+            "batch_not_completed",
+            f"batch {record.get('batch_id')} is {record.get('status')}, not a completed "
+            "diagnosis; only a completed verdict can authorise clearing a root cause",
+        )
+    if latest_completed_batch_id != record.get("batch_id"):
+        return reject(
+            "stale_batch",
+            "a newer completed diagnosis exists; the submitted batch no longer "
+            "represents the current situation, so its clear request is refused",
+        )
+    if record.get("state_version") != expected_version:
+        return reject(
+            "stale_batch",
+            f"the submitted state_version {expected_version} does not match batch "
+            f"{record.get('batch_id')} (version {record.get('state_version')})",
+        )
+    if current_state_version != expected_version:
+        return reject(
+            "state_version_conflict",
+            f"global state version changed from {expected_version} to "
+            f"{current_state_version} after the submitted diagnosis; the old clear "
+            "request is refused and nothing was modified",
+        )
+
+    target_state = next(
+        (state for state in service_states if state.get("service") == target), None
+    )
+    if target_state is None or not target_state.get("reachable"):
+        return reject(
+            "target_unreachable",
+            f"service {target} is currently unreachable, so its local fault cannot be "
+            "cleared through the admin API; nothing was modified",
+        )
+
+    result = record.get("result") or {}
+    probes = result.get("probes") or {}
+    target_probe = probes.get(target) or {}
+    batch_epoch = target_probe.get("config_epoch")
+    current_epoch = target_state.get("config_epoch")
+    if batch_epoch is None or current_epoch is None or batch_epoch != current_epoch:
+        return {
+            "allowed": False,
+            "error": "target_config_changed",
+            "message": (
+                f"{target} configuration epoch changed since the submitted diagnosis "
+                f"(batch config_epoch={batch_epoch}, current config_epoch={current_epoch}); "
+                "the fault may have been re-set directly on the service, so the old "
+                "clear request is refused and nothing was modified"
+            ),
+            "batch_config_epoch": batch_epoch,
+            "current_config_epoch": current_epoch,
+        }
+
+    ok, error, message = _classify_clearable_root(result, target, target_probe)
+    if not ok:
+        return reject(error, message or "target is not a clearable local root cause")
+    return {
+        "allowed": True,
+        "error": None,
+        "message": None,
+        "batch_config_epoch": batch_epoch,
+        "current_config_epoch": current_epoch,
+    }
+
+
+def _classify_clearable_root(
+    result: dict[str, Any], target: str, target_probe: dict[str, Any]
+) -> tuple[bool, str | None, str | None]:
+    """Only reachable local liveness/readiness root causes may be cleared."""
+    if result.get("outcome") != "root_cause_found":
+        return False, "not_root_cause_verdict", (
+            f"the latest diagnosis outcome is {result.get('outcome')!r}, not "
+            "root_cause_found; there is no confirmed local root cause to clear"
+        )
+    root = next(
+        (item for item in result.get("root_causes", []) if item.get("service") == target),
+        None,
+    )
+    if root is None:
+        if any(
+            item.get("service") == target
+            for item in result.get("affected_services", [])
+        ):
+            hint = "it is only a collateral service whose failure is explained by a dependency"
+        else:
+            hint = "it is not reported as a root cause in the submitted diagnosis"
+        return False, "target_not_root_cause", (
+            f"{target} cannot be cleared from this diagnosis: {hint}"
+        )
+    failure = root.get("failure")
+    if failure == "unreachable":
+        return False, "target_unreachable", (
+            f"{target} was unreachable when diagnosed; an unreachable process has no "
+            "admin endpoint to clear, so this root cause cannot be removed here"
+        )
+    if failure not in ("liveness", "readiness"):
+        return False, "target_not_clearable", (
+            f"{target} root cause has unsupported failure kind {failure!r}"
+        )
+    # Defence in depth: the evidence behind the verdict must be a reachable,
+    # parseable local failure — never a timeout or an unusable response.
+    for endpoint in ENDPOINTS:
+        ev = target_probe.get(endpoint) or {}
+        if ev.get("kind") not in ("ok", "http_error") or ev.get("unreachable"):
+            return False, "target_evidence_not_clearable", (
+                f"{target} /health/{endpoint} evidence is {ev.get('kind')!r}; only a "
+                "reachable local liveness/readiness failure can be cleared"
+            )
+    return True, None, None
+
+
 def _retest_result(
     *, evidence: list[str], reasons: list[str], expected_version: int
 ) -> dict[str, Any]:
@@ -345,4 +491,4 @@ def _dedupe(items: list[str]) -> list[str]:
     return result
 
 
-__all__ = ["evaluate"]
+__all__ = ["assess_clear_request", "evaluate"]

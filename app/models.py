@@ -66,6 +66,59 @@ class ResetFaultsResponse(BaseModel):
     warnings: list[str] = Field(default_factory=list)
 
 
+class ClearRootCauseRequest(BaseModel):
+    """Optimistic request to clear one diagnosed local root cause."""
+
+    batch_id: str = Field(
+        description="The diagnosis batch the caller observed (the verdict to act on)."
+    )
+    state_version: int = Field(
+        ge=0,
+        description=(
+            "Global state version observed in that batch. The request is refused if "
+            "the global version has moved since."
+        ),
+    )
+    target_service: ServiceName = Field(
+        description=(
+            "The single service whose local liveness/readiness fault must be cleared. "
+            "Only that service is touched; other services' faults stay in place."
+        )
+    )
+
+
+class RootCauseClearResponse(BaseModel):
+    status: Literal["cleared", "pending_verification"] = Field(
+        description=(
+            "cleared: the follow-up diagnosis confirms the target is no longer a root "
+            "cause. pending_verification: the clear was applied (or attempted) but the "
+            "verification is inconclusive — probe timeout, unclear receipt or a change "
+            "during verification — and must be re-checked."
+        )
+    )
+    target_service: str
+    submitted_batch_id: str
+    submitted_state_version: int
+    previous_state_version: int
+    state_version: int = Field(description="Global version after the clear was applied.")
+    verification_batch_id: str
+    verification_state_version: int
+    verification_outcome: Outcome | str | None = None
+    target_still_root_cause: bool
+    remaining_root_causes: list[RootCause] = Field(default_factory=list)
+    config_epoch_before: int | None = None
+    config_epoch_after: int | None = None
+    clear_applied: bool = Field(
+        description="Whether the target service's admin reset call was acknowledged."
+    )
+    reasons: list[str] = Field(
+        default_factory=list,
+        description="Why the result is pending_verification (empty when cleared).",
+    )
+    service_states: list[MockState]
+    warnings: list[str] = Field(default_factory=list)
+
+
 class DependencyEdge(BaseModel):
     service: str
     depends_on: list[str]

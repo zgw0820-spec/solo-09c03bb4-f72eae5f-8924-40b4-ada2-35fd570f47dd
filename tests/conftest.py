@@ -5,6 +5,7 @@ Run with:  python -m pytest -q
 from __future__ import annotations
 
 import os
+import signal
 import socket
 import subprocess
 import sys
@@ -125,6 +126,26 @@ class Stack:
         proc.wait(timeout=10)
         self._spawn("app.main:app", self.api_port, f"diagnosis-api-restart-{time.monotonic_ns()}")
         _wait_http(self.api_url + "/health")
+
+    def stop_service(self, service: str) -> None:
+        """Terminate one simulated service (used by the clear-API tests)."""
+        index = list(self.ports).index(service)
+        proc = self.proc[index]
+        proc.terminate()
+        try:
+            proc.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait(timeout=10)
+
+    def pause_service(self, service: str) -> None:
+        """Freeze one service process (SIGSTOP): its probes then time out."""
+        index = list(self.ports).index(service)
+        self.proc[index].send_signal(signal.SIGSTOP)
+
+    def resume_service(self, service: str) -> None:
+        index = list(self.ports).index(service)
+        self.proc[index].send_signal(signal.SIGCONT)
 
 
 @pytest.fixture(scope="session")

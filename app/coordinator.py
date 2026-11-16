@@ -28,7 +28,7 @@ from typing import Any
 import httpx
 
 from .config import DEPENDS_ON, ROLES, SERVICES, Settings
-from .diagnosis import evaluate
+from .diagnosis import assess_clear_request, evaluate
 from .probes import ServiceCallError, ServiceClient
 from .store import Store
 
@@ -44,6 +44,19 @@ class VersionConflictError(RuntimeError):
         )
         self.expected = expected
         self.current = current
+
+
+class StaleClearRequestError(RuntimeError):
+    """A single-root-cause clear request was refused before any write.
+
+    ``error`` is a stable machine-readable code mirrored in the HTTP 409/404
+    detail so clients can branch on it; nothing was modified when this raised.
+    """
+
+    def __init__(self, error: str, message: str) -> None:
+        super().__init__(message)
+        self.error = error
+        self.message = message
 
 
 class Coordinator:
@@ -263,6 +276,247 @@ class Coordinator:
             "service_states": await self.service_states(),
             "warnings": warnings,
         }
+
+    async def clear_root_cause(
+        self,
+        *,
+        batch_id: str,
+        expected_version: int,
+        target: str,
+        wait_seconds: float,
+    ) -> dict[str, Any]:
+        """Clear exactly one diagnosed local root cause, then verify by diagnosis.
+
+        The whole decision and the single-service write happen under the state
+        lock so an old (replayed) request can never overwrite a fault that was
+        set later. Verification runs as a normal batch *outside* the lock.
+        """
+        if target not in SERVICES:
+            raise UnknownServiceError(f"unknown service {target!r}")
+
+        async with self._state_lock:
+            record = self.store.get_batch(batch_id)
+            latest_completed = self.store.latest_batch(completed_only=True)
+            states_before = await self.service_states()
+            assessment = assess_clear_request(
+                record=record,
+                latest_completed_batch_id=(
+                    latest_completed["batch_id"] if latest_completed else None
+                ),
+                expected_version=expected_version,
+                current_state_version=self.state_version,
+                target=target,
+                service_states=states_before,
+            )
+            if not assessment["allowed"]:
+                raise StaleClearRequestError(
+                    assessment["error"], assessment["message"] or "clear request refused"
+                )
+            epoch_before = assessment["batch_config_epoch"]
+
+            # Bump and synchronise the version first, mirroring PUT /faults, so
+            # the verification probes see one consistent global version.
+            previous, current = self._bump_version_locked()
+            client = await self._make_client()
+            try:
+                sync_states = await client.sync_all(current)
+                reset_error: str | None = None
+                clear_applied = True
+                try:
+                    # Only the target service is reset: other services' local
+                    # faults are never touched by this operation.
+                    await client.reset_fault(target)
+                except ServiceCallError as exc:
+                    clear_applied = False
+                    reset_error = str(exc)
+                states_after = await client.snapshot_states()
+                for state in states_after:
+                    if state.get("reachable") and state.get("config_epoch") is not None:
+                        self._expected_epochs[state["service"]] = state["config_epoch"]
+            finally:
+                await self._close_client(client)
+
+            target_state_after = next(
+                (s for s in states_after if s.get("service") == target), {}
+            )
+            epoch_after = target_state_after.get("config_epoch")
+
+        warnings: list[str] = []
+        unsynced = [s["service"] for s in sync_states if not s.get("synced")]
+        if unsynced:
+            warnings.append(
+                "state version sync failed for: "
+                + ", ".join(unsynced)
+                + "; the verification diagnosis can only report needs_retest until "
+                "they catch up"
+            )
+        if not clear_applied:
+            warnings.append(
+                f"the version advanced to {current} but {target}'s fault reset was not "
+                f"acknowledged: {reset_error}"
+            )
+
+        # Verification: a fresh diagnosis against the new, current version.
+        created = await self.create_batch()
+        verification = await self.wait_for_batch(
+            created["batch_id"], wait_seconds
+        )
+
+        reasons: list[str] = []
+        if not clear_applied:
+            reasons.append(
+                f"the clear receipt from {target} is unclear: the admin reset call "
+                f"failed ({reset_error}); the fault may still be in place"
+            )
+        if verification is None or verification.get("status") == "running":
+            reasons.append(
+                "the verification diagnosis did not finish within the wait budget; "
+                f"poll GET /diagnosis/{created['batch_id']} before trusting the clear"
+            )
+            return self._clear_response(
+                status="pending_verification",
+                target=target,
+                batch_id=batch_id,
+                expected_version=expected_version,
+                previous=previous,
+                current=current,
+                verification=verification or created,
+                states_after=states_after,
+                epoch_before=epoch_before,
+                epoch_after=epoch_after,
+                clear_applied=clear_applied,
+                reasons=reasons,
+                warnings=warnings,
+            )
+
+        result = verification.get("result") or {}
+        if verification.get("status") != "completed":
+            reasons.append(
+                f"the verification batch ended as {verification.get('status')}; its "
+                "probes are not a trustworthy confirmation"
+            )
+        if result.get("outcome") == "needs_retest":
+            reasons.append(
+                "the verification diagnosis is needs_retest: "
+                + "; ".join(result.get("retest_reasons") or [])
+            )
+        if result.get("state_version") != current:
+            reasons.append(
+                "the global state version changed while the verification diagnosis was "
+                "running, so its evidence is not current"
+            )
+        if verification.get("superseded"):
+            reasons.append(
+                "the verification batch was superseded by an even newer diagnosis "
+                "before it finished"
+            )
+
+        remaining = [
+            root
+            for root in result.get("root_causes", [])
+            if root.get("service") != target
+        ]
+        target_still_root = any(
+            root.get("service") == target for root in result.get("root_causes", [])
+        )
+        if target_still_root:
+            reasons.append(
+                f"{target} is still reported as a root cause by the verification "
+                "diagnosis, so the clear cannot be confirmed"
+            )
+        # Re-check the target's configuration one last time: any change during
+        # verification means the evidence may describe a different configuration.
+        states_now = await self.service_states()
+        target_now = next(
+            (s for s in states_now if s.get("service") == target), {}
+        )
+        if self.state_version != current:
+            reasons.append(
+                f"the global state version moved again (now {self.state_version}) "
+                "before the verification was evaluated"
+            )
+        if (
+            target_now.get("reachable")
+            and target_now.get("config_epoch") is not None
+            and target_now.get("config_epoch") != epoch_after
+        ):
+            reasons.append(
+                f"{target} configuration changed during verification "
+                f"(config_epoch {epoch_after} -> {target_now.get('config_epoch')})"
+            )
+            states_after = states_now
+
+        cleared = not reasons
+        return self._clear_response(
+            status="cleared" if cleared else "pending_verification",
+            target=target,
+            batch_id=batch_id,
+            expected_version=expected_version,
+            previous=previous,
+            current=current,
+            verification=verification,
+            states_after=states_after,
+            epoch_before=epoch_before,
+            epoch_after=epoch_after,
+            clear_applied=clear_applied,
+            reasons=reasons,
+            warnings=warnings,
+            remaining_root_causes=remaining,
+            target_still_root=target_still_root,
+        )
+
+    def _clear_response(
+        self,
+        *,
+        status: str,
+        target: str,
+        batch_id: str,
+        expected_version: int,
+        previous: int,
+        current: int,
+        verification: dict[str, Any],
+        states_after: list[dict[str, Any]],
+        epoch_before: int | None,
+        epoch_after: int | None,
+        clear_applied: bool,
+        reasons: list[str],
+        warnings: list[str],
+        remaining_root_causes: list[dict[str, Any]] | None = None,
+        target_still_root: bool = False,
+    ) -> dict[str, Any]:
+        result = verification.get("result") or {}
+        return {
+            "status": status,
+            "target_service": target,
+            "submitted_batch_id": batch_id,
+            "submitted_state_version": expected_version,
+            "previous_state_version": previous,
+            "state_version": current,
+            "verification_batch_id": verification["batch_id"],
+            "verification_state_version": verification.get("state_version", current),
+            "verification_outcome": result.get("outcome"),
+            "target_still_root_cause": target_still_root,
+            "remaining_root_causes": remaining_root_causes or [],
+            "config_epoch_before": epoch_before,
+            "config_epoch_after": epoch_after,
+            "clear_applied": clear_applied,
+            "reasons": reasons,
+            "service_states": states_after,
+            "warnings": warnings,
+        }
+
+    async def wait_for_batch(
+        self, batch_id: str, budget: float
+    ) -> dict[str, Any] | None:
+        """Wait up to ``budget`` seconds for a batch to leave the running state."""
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + budget
+        while loop.time() < deadline:
+            record = self.get_batch(batch_id)
+            if record is not None and record.get("status") != "running":
+                return record
+            await asyncio.sleep(0.02)
+        return self.get_batch(batch_id)
 
     async def sync_all_services(self, version: int) -> list[dict[str, Any]]:
         client = await self._make_client()
@@ -530,4 +784,9 @@ def _dedupe(items: list[str]) -> list[str]:
     return out
 
 
-__all__ = ["Coordinator", "UnknownServiceError", "VersionConflictError"]
+__all__ = [
+    "Coordinator",
+    "StaleClearRequestError",
+    "UnknownServiceError",
+    "VersionConflictError",
+]

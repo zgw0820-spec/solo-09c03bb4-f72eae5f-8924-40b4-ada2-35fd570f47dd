@@ -1,24 +1,29 @@
 """FastAPI application: fault-injection control plane and diagnosis API."""
 from __future__ import annotations
 
-import asyncio
 from contextlib import asynccontextmanager
 from typing import Any
 
 from fastapi import FastAPI, Header, HTTPException, Query, Request, status
 from fastapi.responses import JSONResponse
 from .config import SERVICES, Settings, load_settings
-from .coordinator import Coordinator, VersionConflictError
+from .coordinator import (
+    Coordinator,
+    StaleClearRequestError,
+    VersionConflictError,
+)
 from .models import (
     BatchAccepted,
     BatchList,
     BatchSummary,
+    ClearRootCauseRequest,
     DiagnosisBatch,
     ErrorResponse,
     FaultPatch,
     FaultSetResponse,
     HealthResponse,
     ResetFaultsResponse,
+    RootCauseClearResponse,
     StateResponse,
     TopologyResponse,
 )
@@ -40,6 +45,14 @@ Locate which layer caused an entry-service outage: **gateway (entry)**,
 * Mixed/foreign `state_version` values, changed configuration during a probe,
   or any probe timeout make the batch `needs_retest` — never a confident root
   cause.
+* `POST /faults/clear-root-cause` clears exactly **one** diagnosed local
+  liveness/readiness root cause on one service. It is optimistic: the caller
+  submits the batch id, the state version and the target service seen in the
+  diagnosis. A stale batch, a moved global version or a changed target
+  configuration is refused with no side effect; after the single-service
+  reset, a fresh diagnosis must confirm the target is no longer a root cause,
+  otherwise the receipt is only "pending verification". Other services'
+  faults are never touched.
 * Batches are persisted in SQLite: completed results survive a restart,
   unfinished ones are reported as `needs_retest`. A late response from an old
   batch is flagged `superseded` and never overrides the newest result.
@@ -199,6 +212,59 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 },
             ) from exc
 
+    @app.post(
+        "/faults/clear-root-cause",
+        response_model=RootCauseClearResponse,
+        responses={
+            404: {"model": ErrorResponse},
+            409: {"model": ErrorResponse},
+            422: {"model": ErrorResponse},
+        },
+        tags=["faults"],
+        summary=(
+            "Clear one diagnosed local root cause (single service) and verify with "
+            "a fresh diagnosis"
+        ),
+    )
+    async def clear_root_cause(
+        body: ClearRootCauseRequest,
+        request: Request,
+        wait_seconds: float | None = Query(
+            default=None,
+            ge=0.05,
+            le=60.0,
+            description="Budget for waiting on the verification diagnosis.",
+        ),
+    ) -> dict[str, Any]:
+        coord: Coordinator = request.app.state.coordinator
+        budget = (
+            wait_seconds
+            if wait_seconds is not None
+            else request.app.state.settings.probe_timeout_seconds + 8.0
+        )
+        try:
+            return await coord.clear_root_cause(
+                batch_id=body.batch_id,
+                expected_version=body.state_version,
+                target=body.target_service,
+                wait_seconds=budget,
+            )
+        except StaleClearRequestError as exc:
+            status_code = (
+                404 if exc.error in ("batch_not_found",) else 409
+            )
+            raise HTTPException(
+                status_code=status_code,
+                detail={
+                    "error": exc.error,
+                    "message": exc.message,
+                    "hint": (
+                        "read GET /diagnosis/latest?completed_only=true and GET /state, "
+                        "then submit a fresh clear request"
+                    ),
+                },
+            ) from exc
+
     # -- diagnosis -----------------------------------------------------
     @app.post(
         "/diagnosis",
@@ -335,14 +401,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 async def _wait_for_batch(
     coordinator: Coordinator, batch_id: str, budget: float
 ) -> dict[str, Any] | None:
-    loop = asyncio.get_running_loop()
-    deadline = loop.time() + budget
-    while loop.time() < deadline:
-        record = coordinator.get_batch(batch_id)
-        if record is not None and record.get("status") != "running":
-            return record
-        await asyncio.sleep(0.02)
-    return coordinator.get_batch(batch_id)
+    return await coordinator.wait_for_batch(batch_id, budget)
 
 
 app = create_app()
