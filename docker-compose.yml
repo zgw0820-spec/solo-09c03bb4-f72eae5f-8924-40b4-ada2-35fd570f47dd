@@ -1,0 +1,117 @@
+name: fault-diagnosis
+
+x-service-env: &service-env
+  GATEWAY_URL: http://gateway:8001
+  AUTH_URL: http://auth:8002
+  ORDER_URL: http://order:8003
+  CACHE_URL: http://cache:8004
+  DIAG_ADMIN_TOKEN: ${DIAG_ADMIN_TOKEN:-}
+  MOCK_ADMIN_TOKEN: ${DIAG_ADMIN_TOKEN:-}
+
+x-mock-service: &mock-service
+  build:
+    context: .
+    dockerfile: Dockerfile
+  restart: unless-stopped
+  environment: *service-env
+
+x-mock-healthcheck: &mock-healthcheck
+  interval: 5s
+  timeout: 3s
+  retries: 12
+  start_period: 5s
+
+services:
+  cache:
+    <<: *mock-service
+    command: ["uvicorn", "app.services.cache:app", "--host", "0.0.0.0", "--port", "8004"]
+    environment:
+      <<: *service-env
+      MOCK_DEP_TIMEOUT: "1.2"
+    ports:
+      - "8004:8004"
+    healthcheck:
+      <<: *mock-healthcheck
+      test: ["CMD-SHELL", "python3 -c \"import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8004/health/live', timeout=2).status == 200 else 1)\""]
+
+  auth:
+    <<: *mock-service
+    command: ["uvicorn", "app.services.auth:app", "--host", "0.0.0.0", "--port", "8002"]
+    environment:
+      <<: *service-env
+      MOCK_DEP_TIMEOUT: "1.2"
+    ports:
+      - "8002:8002"
+    depends_on:
+      cache:
+        condition: service_healthy
+    healthcheck:
+      <<: *mock-healthcheck
+      test: ["CMD-SHELL", "python3 -c \"import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8002/health/live', timeout=2).status == 200 else 1)\""]
+
+  order:
+    <<: *mock-service
+    command: ["uvicorn", "app.services.order:app", "--host", "0.0.0.0", "--port", "8003"]
+    environment:
+      <<: *service-env
+      MOCK_DEP_TIMEOUT: "1.2"
+    ports:
+      - "8003:8003"
+    depends_on:
+      cache:
+        condition: service_healthy
+    healthcheck:
+      <<: *mock-healthcheck
+      test: ["CMD-SHELL", "python3 -c \"import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8003/health/live', timeout=2).status == 200 else 1)\""]
+
+  gateway:
+    <<: *mock-service
+    command: ["uvicorn", "app.services.gateway:app", "--host", "0.0.0.0", "--port", "8001"]
+    environment:
+      <<: *service-env
+      MOCK_DEP_TIMEOUT: "2.5"
+    ports:
+      - "8001:8001"
+    depends_on:
+      auth:
+        condition: service_healthy
+      order:
+        condition: service_healthy
+    healthcheck:
+      <<: *mock-healthcheck
+      test: ["CMD-SHELL", "python3 -c \"import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8001/health/live', timeout=2).status == 200 else 1)\""]
+
+  diagnosis:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    command: ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
+    environment:
+      <<: *service-env
+      DIAG_DB_PATH: /data/diagnosis.db
+      DIAG_PROBE_TIMEOUT: ${DIAG_PROBE_TIMEOUT:-2.0}
+      DIAG_ADMIN_TIMEOUT: ${DIAG_ADMIN_TIMEOUT:-1.0}
+      DIAG_WATCH_INTERVAL: ${DIAG_WATCH_INTERVAL:-0.5}
+    volumes:
+      - diagnosis-data:/data
+    ports:
+      - "8000:8000"
+    depends_on:
+      gateway:
+        condition: service_healthy
+      auth:
+        condition: service_healthy
+      order:
+        condition: service_healthy
+      cache:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "python3 -c \"import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=2).status == 200 else 1)\""]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+      start_period: 5s
+
+volumes:
+  diagnosis-data:
